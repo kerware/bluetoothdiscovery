@@ -2,9 +2,7 @@ package fr.caensup.bluetoothdiscovery
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothManager
+import android.bluetooth.*
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -28,7 +26,12 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import fr.caensup.bluetoothdiscovery.ui.theme.BluetoothdiscoveryTheme
 
-data class FoundDevice(val name: String?, val address: String)
+data class FoundDevice(
+    val name: String?,
+    val address: String,
+    val isBonded: Boolean = false,
+    val services: List<String> = emptyList()
+)
 
 class MainActivity : ComponentActivity() {
 
@@ -44,12 +47,31 @@ class MainActivity : ComponentActivity() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
                 BluetoothDevice.ACTION_FOUND -> {
-                    val device: BluetoothDevice? =
+                    val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
                         intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }
                     device?.let {
-                        val foundDevice = FoundDevice(it.name, it.address)
-                        if (!discoveredDevices.contains(foundDevice)) {
+                        val foundDevice = FoundDevice(it.name, it.address, it.bondState == BluetoothDevice.BOND_BONDED)
+                        if (discoveredDevices.none { d -> d.address == it.address }) {
                             discoveredDevices.add(foundDevice)
+                        }
+                    }
+                }
+                BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
+                    val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }
+                    val bondState = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
+                    device?.let { dev ->
+                        val index = discoveredDevices.indexOfFirst { it.address == dev.address }
+                        if (index != -1) {
+                            discoveredDevices[index] = discoveredDevices[index].copy(isBonded = bondState == BluetoothDevice.BOND_BONDED)
                         }
                     }
                 }
@@ -60,7 +82,10 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        val filter = IntentFilter(BluetoothDevice.ACTION_FOUND)
+        val filter = IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_FOUND)
+            addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        }
         registerReceiver(receiver, filter)
 
         setContent {
@@ -72,13 +97,16 @@ class MainActivity : ComponentActivity() {
                     BluetoothScannerScreen(
                         devices = discoveredDevices,
                         onStartScan = { startDiscovery() },
-                        onStopScan = { stopDiscovery() }
+                        onStopScan = { stopDiscovery() },
+                        onPairDevice = { address -> pairDevice(address) },
+                        onListServices = { address -> discoverServices(address) }
                     )
                 }
             }
         }
     }
 
+    @SuppressLint("MissingPermission")
     private fun startDiscovery() {
         if (!hasPermissions()) {
             Toast.makeText(this, "Permissions manquantes", Toast.LENGTH_SHORT).show()
@@ -96,17 +124,45 @@ class MainActivity : ComponentActivity() {
         }
 
         discoveredDevices.clear()
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-             bluetoothAdapter?.startDiscovery()
-             Toast.makeText(this, "Recherche lancée", Toast.LENGTH_SHORT).show()
-        }
+        bluetoothAdapter?.startDiscovery()
+        Toast.makeText(this, "Recherche lancée", Toast.LENGTH_SHORT).show()
     }
 
+    @SuppressLint("MissingPermission")
     private fun stopDiscovery() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            bluetoothAdapter?.cancelDiscovery()
-            Toast.makeText(this, "Recherche arrêtée", Toast.LENGTH_SHORT).show()
-        }
+        bluetoothAdapter?.cancelDiscovery()
+        Toast.makeText(this, "Recherche arrêtée", Toast.LENGTH_SHORT).show()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun pairDevice(address: String) {
+        val device = bluetoothAdapter?.getRemoteDevice(address)
+        device?.createBond()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun discoverServices(address: String) {
+        val device = bluetoothAdapter?.getRemoteDevice(address)
+        device?.connectGatt(this, false, object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    gatt.discoverServices()
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    gatt.close()
+                }
+            }
+
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    val serviceUuids = gatt.services.map { it.uuid.toString() }
+                    val index = discoveredDevices.indexOfFirst { it.address == address }
+                    if (index != -1) {
+                        discoveredDevices[index] = discoveredDevices[index].copy(services = serviceUuids)
+                    }
+                }
+                gatt.disconnect()
+            }
+        })
     }
 
     private fun hasPermissions(): Boolean {
@@ -137,7 +193,9 @@ class MainActivity : ComponentActivity() {
 fun BluetoothScannerScreen(
     devices: List<FoundDevice>,
     onStartScan: () -> Unit,
-    onStopScan: () -> Unit
+    onStopScan: () -> Unit,
+    onPairDevice: (String) -> Unit,
+    onListServices: (String) -> Unit
 ) {
     val context = LocalContext.current
     val permissionsToRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -195,14 +253,22 @@ fun BluetoothScannerScreen(
             contentPadding = PaddingValues(vertical = 8.dp)
         ) {
             items(devices) { device ->
-                DeviceItem(device)
+                DeviceItem(
+                    device = device,
+                    onPair = { onPairDevice(device.address) },
+                    onListServices = { onListServices(device.address) }
+                )
             }
         }
     }
 }
 
 @Composable
-fun DeviceItem(device: FoundDevice) {
+fun DeviceItem(
+    device: FoundDevice,
+    onPair: () -> Unit,
+    onListServices: () -> Unit
+) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -220,6 +286,40 @@ fun DeviceItem(device: FoundDevice) {
                 text = device.address,
                 style = MaterialTheme.typography.bodySmall
             )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            if (device.isBonded) {
+                Text(
+                    text = "Appairé",
+                    color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Button(
+                    onClick = onListServices,
+                    modifier = Modifier.padding(top = 8.dp)
+                ) {
+                    Text("Lister les services disponibles")
+                }
+                
+                if (device.services.isNotEmpty()) {
+                    Text(
+                        text = "Services :",
+                        style = MaterialTheme.typography.labelLarge,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                    device.services.forEach { serviceUuid ->
+                        Text(
+                            text = "- $serviceUuid",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            } else {
+                Button(onClick = onPair) {
+                    Text("Appairage")
+                }
+            }
         }
     }
 }
